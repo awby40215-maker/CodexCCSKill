@@ -6,7 +6,7 @@ description: >-
   action, and verification with the smallest complete change.
 license: MIT
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # CodexCCSKill

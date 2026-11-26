@@ -142,7 +142,8 @@ def record_write(state, call):
     state["requires_verification"] = True
 
 
-def verify_command(state, call, argv):
+def verify_command(event, state, call, argv):
+    reconcile_patches(event, state)
     if state["patches"]:
         return deny("Wait for the current edit to finish before verifying.")
     if state["checks"]:
@@ -212,10 +213,11 @@ def before_tool(event, state):
         if state["checks"]:
             return deny("Wait for verification to finish before editing files.")
         record_write(state, call)
+        state.setdefault("patch_invocations", {})[call] = patch_invocation(event, call)
         return {}
     if not strict:
         if command.startswith(verify_prefix):
-            return verify_command(state, call, command_args(command.removeprefix(verify_prefix)))
+            return verify_command(event, state, call, command_args(command.removeprefix(verify_prefix)))
         if command.startswith(run_prefix):
             if state["checks"]:
                 return deny("Wait for verification to finish before running a command that changes state.")
@@ -230,7 +232,7 @@ def before_tool(event, state):
     except ValueError:
         argv = []
     if argv == state["check"] and cwd == root:
-        return verify_command(state, call, argv)
+        return verify_command(event, state, call, argv)
     safe_read = read_command(argv) if argv and not any(
         arg in {"|", "||", "&&", "&", ";", ">", ">>", "<"} for arg in argv
     ) else None
@@ -246,6 +248,7 @@ def after_tool(event, state):
     call = event["tool_use_id"]
     if call in state["patches"]:
         state["patches"].remove(call)
+        state.get("patch_invocations", {}).pop(call, None)
     token = state["checks"].pop(call, None)
     if token:
         output = event.get("tool_response")
@@ -264,6 +267,71 @@ def reverse_lines(file):
         prefix, *lines = (file.read(count) + prefix).split(b"\n")
         yield from reversed(lines)
     yield prefix
+
+
+def patch_transcript(event):
+    path = event.get("transcript_path")
+    if not path:
+        return
+    turn = event["turn_id"]
+    try:
+        with Path(path).open("rb") as file:
+            for line in reverse_lines(file):
+                if not any(marker in line for marker in (
+                    b'"custom_tool_call"', b'"function_call"', b'"custom_tool_call_output"',
+                    b'"function_call_output"', b'"task_started"', b'"FileChange"',
+                )):
+                    continue
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                payload = row["payload"]
+                if row["type"] == "response_item":
+                    yield payload
+                elif row["type"] == "event_msg" and payload.get("turn_id") == turn:
+                    if payload.get("type") == "task_started":
+                        return
+                    if payload.get("type") == "item_completed":
+                        yield payload
+    except OSError:
+        return
+
+
+def patch_invocation(event, call):
+    completed = set()
+    for entry in patch_transcript(event):
+        kind, parent = entry.get("type"), entry.get("call_id")
+        if kind in ("custom_tool_call_output", "function_call_output"):
+            completed.add(parent)
+        elif kind in ("custom_tool_call", "function_call"):
+            name = entry.get("name")
+            if (name == "apply_patch" and parent == call) or (kind == "custom_tool_call" and name == "exec"):
+                return parent if parent not in completed else None
+    return None
+
+
+def reconcile_patches(event, state):
+    tracked = state.get("patch_invocations", {})
+    if not tracked:
+        return
+    for entry in patch_transcript(event):
+        kind = entry.get("type")
+        if kind == "item_completed":
+            item = entry.get("item", {})
+            finished = [item.get("id")] if item.get("type") == "FileChange" else []
+        elif kind in ("custom_tool_call_output", "function_call_output"):
+            parent = entry.get("call_id")
+            # A rejected synchronous patch may only have an enclosing tool result.
+            finished = [call for call, invocation in tracked.items() if parent and invocation == parent]
+        else:
+            continue
+        for call in finished:
+            if call in tracked:
+                tracked.pop(call)
+                state["patches"].remove(call)
+        if not tracked:
+            return
 
 
 def companion_action(command):
@@ -373,6 +441,7 @@ def process(event, state, header):
     if kind == "Interrupt":
         return None, {}
     if kind == "Stop":
+        reconcile_patches(event, state)
         progress = None
         if state["check"] is None:
             try:
