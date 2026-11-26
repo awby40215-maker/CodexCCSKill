@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodexCCSKill"
+  short_description: "Finish scoped tasks with verifiable results"
+  default_prompt: "Use $codexccskill to confirm the scope and acceptance criteria, make the smallest complete change, and verify the result."

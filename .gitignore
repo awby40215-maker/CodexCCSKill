@@ -1,0 +1,14 @@
+# Local configuration and guard state
+/.codex/
+external-updates.json
+hooks.json
+hooks.before-*.json
+guard.before-*.py
+guard.opt-in.py
+turns.sqlite3
+turns.sqlite3-*
+
+# Local build artifacts and caches
+/dist/
+.DS_Store
+__pycache__/
